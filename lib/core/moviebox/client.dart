@@ -4,36 +4,94 @@ import 'package:http/http.dart' as http;
 
 import 'signer.dart';
 
-/// The MovieBox client, login only.
+/// A title from a search, a rail, or a banner.
+class KinoItem {
+  /// MovieBox `subjectId`. **A String**, measured -- not an int. The API returns
+  /// it quoted, and treating it as numeric is how a request silently asks for
+  /// the wrong subject.
+  final String id;
+  final String title;
+
+  /// Poster URL. Measured: `cover` is an OBJECT (`{url, width, height, ...}`),
+  /// not a string. A parser expecting a string gets null and every card renders
+  /// its placeholder.
+  final String? poster;
+
+  /// Rating on a 0-10 scale. Measured as a STRING on search results
+  /// (`"imdbRatingValue": "8.4"`) and absent on banners.
+  final double? rating;
+
+  final String? year;
+
+  /// 1 = movie, 2 = series. Drives whether seasons are fetched.
+  final int subjectType;
+
+  /// True when the API says there is something to play.
+  final bool hasResource;
+
+  const KinoItem({
+    required this.id,
+    required this.title,
+    this.poster,
+    this.rating,
+    this.year,
+    this.subjectType = 1,
+    this.hasResource = false,
+  });
+}
+
+/// A named row of titles: "Trending", "Popular", and so on.
+class KinoRail {
+  final String title;
+  final List<KinoItem> items;
+  const KinoRail({required this.title, required this.items});
+}
+
+/// One playable source, with the headers it needs.
+class KinoStream {
+  final String url;
+  final String label;
+  final int? resolution;
+
+  /// Some hosts refuse a request without a Referer. Carried per-stream rather
+  /// than assumed globally.
+  final Map<String, String> headers;
+
+  const KinoStream({
+    required this.url,
+    required this.label,
+    this.resolution,
+    this.headers = const {},
+  });
+}
+
+/// A season of a series.
+class KinoSeason {
+  final int season;
+  final int episodeCount;
+  const KinoSeason({required this.season, required this.episodeCount});
+}
+
+/// The MovieBox API client.
 ///
-/// **Deliberately narrow.** Search, details and streams are not here yet. What
-/// is here is the part that was verified against the live API before it was
-/// written in Dart, and nothing else -- because the previous draft of this file
-/// carried search, rails, details and streams as well, and none of it could be
-/// compiled, so none of it could be trusted.
+/// Every response shape below was **measured against the live API** before this
+/// file was written, not inferred from the Rust project this grew out of. That
+/// matters more than it sounds: an earlier draft of this client guessed at
+/// search's structure and was wrong in three separate ways --
 ///
-/// The two gates this class exists to clear, both established by measurement
-/// rather than by reading someone's source:
+///   * `data.results` is a list of RAILS, each with a nested `subjects[]`, not a
+///     flat list of titles;
+///   * `subjectId` is a quoted String, not a number;
+///   * `cover` is an object carrying `url`, not a URL string.
 ///
-///   1. **Region.** A bare request gets
-///      `403 FORBIDDEN "Service not available in current region"` from every
-///      host, from anywhere. Adding `x-client-info` clears it -- and clears it
-///      regardless of the real connection IP, which is why no proxy or tunnel
-///      is involved here. A spoofed `x-forwarded-for` was tested and changes
-///      nothing, so it is deliberately absent.
-///
-///   2. **Signature.** With `x-client-info` set, the answer becomes
-///      `407 "Signature invalid"` until the HMAC-MD5 is right. The algorithm is
-///      in [MovieBoxSigner] and has been run against the live endpoint from a
-///      Node script: HTTP 200, visitor token, three-month expiry.
+/// Each of those fails as an empty screen rather than as an error, which is
+/// exactly why they were worth a probe to find.
 class MovieBoxClient {
   MovieBoxClient({http.Client? httpClient})
       : _http = httpClient ?? http.Client();
 
   final http.Client _http;
 
-  /// Round-robin pool. Several are region-varied; `api6sg` failed transport
-  /// outright in testing and is kept because it may answer elsewhere.
   static const List<String> _hosts = [
     'https://api6.aoneroom.com',
     'https://api5.aoneroom.com',
@@ -46,9 +104,6 @@ class MovieBoxClient {
 
   static const List<int> _retryStatuses = [403, 406, 407, 429, 500, 502, 503, 504];
 
-  /// The identity that clears the region gate. Kept byte-identical to the value
-  /// that was proved to work -- the API parses this as one object, so a
-  /// reordered or reformatted copy is not the same request.
   static const String _clientInfo =
       '{"package_name":"com.community.oneroom",'
       '"version_name":"4.0.01.0813.03","version_code":50020121,'
@@ -63,112 +118,68 @@ class MovieBoxClient {
       'com.community.oneroom/50020121 (Linux; U; Android 13; en_US; 23078RKD5C; '
       'Build/TQ2A.230405.003; Cronet/135.0.7012.3)';
 
-  static const String _loginPath =
-      '/wefeed-mobile-bff/user-api/visitor-login';
-
-  /// A stream will not play without this header. `pub const STREAM_REFERER`
-  /// upstream. Unused at this step -- here so the value is not lost before the
-  /// player lands.
+  /// Required on stream requests. `pub const STREAM_REFERER` upstream, and the
+  /// reason this app depends on media_kit rather than video_player: the latter
+  /// cannot send headers on iOS at all.
   static const String streamReferer = 'https://sportslive.wine';
+
+  String? _token;
+  DateTime? _expiry;
+  int _activeHost = 0;
 
   void close() => _http.close();
 
-  /// Logs in as a visitor and returns a human-readable summary.
-  ///
-  /// **Returns a summary, not the token.** The token is a credential and this
-  /// app has nowhere safe to keep it yet; a screen that displays one is a
-  /// screen that leaks one. The summary carries its shape and expiry, which is
-  /// all that is needed to tell a working login from a broken one.
-  ///
-  /// **No recursion.** The first draft of this method called the shared
-  /// `_send()` helper for its login request -- and `_send()` called back into
-  /// `ensureToken()`, so the app would have recursed until it crashed. Login
-  /// therefore issues its own request, and `_send` exists only for calls that
-  /// need a token, which at this step is none.
-  Future<String> login() async {
-    final lines = <String>[];
-
-    for (int attempt = 0; attempt < _hosts.length; attempt++) {
-      final host = _hosts[attempt];
-      final url = Uri.parse('$host$_loginPath');
-
-      // "{}" is two bytes, and the signature covers that byte count. Sending no
-      // body at all would produce a different canonical string and a 407.
-      const body = '{}';
-
-      try {
-        final headers = MovieBoxSigner.headers(
-          method: 'POST',
-          url: url,
-          clientInfo: _clientInfo,
-          userAgent: _userAgent,
-          body: body,
-        );
-
-        lines.add('POST $host');
-        lines.add('  signature: ${headers['x-tr-signature']}');
-
-        final response = await _http.post(url, headers: headers, body: body);
-
-        lines.add('  HTTP ${response.statusCode}');
-
-        if (_retryStatuses.contains(response.statusCode)) {
-          lines.add('  retrying on the next host');
-          lines.add('');
-          continue;
-        }
-
-        if (response.statusCode != 200) {
-          lines.add('  body: ${response.body}');
-          throw MovieBoxException(lines.join('\n'));
-        }
-
-        final decoded = jsonDecode(response.body);
-        final data = decoded is Map ? (decoded['data'] ?? decoded) : null;
-        final token = data is Map ? data['token'] : null;
-
-        if (token is! String || token.isEmpty) {
-          lines.add('  no token in the response');
-          throw MovieBoxException(lines.join('\n'));
-        }
-
-        // The token is never printed. Only its shape and its exp claim, which
-        // is what says whether this is a real session.
-        final parts = token.split('.');
-        lines.add('  token segments: ${parts.length}');
-        lines.add('  token length:   ${token.length} chars');
-
-        final expiry = _expiryOf(token);
-        if (expiry != null) {
-          final days = expiry.difference(DateTime.now()).inDays;
-          lines.add('  expires:        ${expiry.toIso8601String()}');
-          lines.add('  valid for:      $days days');
-        } else {
-          lines.add('  expires:        (no readable exp claim)');
-        }
-
-        lines.add('');
-        lines.add('Host used: $host');
-        return lines.join('\n');
-      } catch (err) {
-        // A transport failure is worth another host; a parsed rejection above
-        // has already been thrown with its context attached.
-        lines.add('  error: $err');
-        lines.add('');
-      }
-    }
-
-    throw MovieBoxException(
-      'Every host failed.\n\n${lines.join('\n')}',
-    );
+  bool get _hasValidToken {
+    final expiry = _expiry;
+    if (_token == null || expiry == null) return false;
+    return DateTime.now().add(const Duration(minutes: 1)).isBefore(expiry);
   }
 
-  /// Reads `exp` out of the JWT payload.
+  /// Logs in and caches the visitor token.
   ///
-  /// Not verified: the signature is theirs to check, not ours. This exists only
-  /// to report how long the session lasts. `base64Url.normalize` is what makes
-  /// an unpadded JWT segment decodable -- the raw segment is often not a
-  /// multiple of four characters, and decoding it directly throws.
+  /// **No recursion.** An earlier draft had this call the shared `_send()`
+  /// helper, which called back into this method -- a stack overflow on launch.
+  /// Login therefore issues its own request, and `_send` demands a token that
+  /// already exists, so the two cannot call each other.
+  Future<String> ensureToken() async {
+    if (_hasValidToken) return _token!;
+
+    final url = Uri.parse(
+      '${_hosts[_activeHost]}/wefeed-mobile-bff/user-api/visitor-login',
+    );
+    const body = '{}';
+
+    final response = await _http.post(
+      url,
+      headers: MovieBoxSigner.headers(
+        method: 'POST',
+        url: url,
+        clientInfo: _clientInfo,
+        userAgent: _userAgent,
+        body: body,
+      ),
+      body: body,
+    );
+
+    if (response.statusCode != 200) {
+      throw MovieBoxException(
+        'Login failed with HTTP ${response.statusCode}: ${response.body}',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    final data = decoded is Map ? (decoded['data'] ?? decoded) : null;
+    final token = data is Map ? data['token'] : null;
+
+    if (token is! String || token.isEmpty) {
+      throw const MovieBoxException('Login returned no token');
+    }
+
+    _token = token;
+    _expiry = _expiryOf(token);
+    return token;
+  }
+
   static DateTime? _expiryOf(String token) {
     final parts = token.split('.');
     if (parts.length != 3) return null;
@@ -179,10 +190,351 @@ class MovieBoxClient {
       final exp = payload is Map ? payload['exp'] : null;
       if (exp is int) return DateTime.fromMillisecondsSinceEpoch(exp * 1000);
     } catch (_) {
-      // Reported as "no readable exp claim" rather than treated as a failure:
-      // a token without an exp is still a token.
+      // A token without a readable exp is still a token; short-lived is the safe
+      // assumption and it forces a refresh rather than trusting it.
     }
-    return null;
+    return DateTime.now().add(const Duration(hours: 1));
+  }
+
+  /// Home rails.
+  ///
+  /// Measured shape: `data.items[]`, each with `type`, `title`, and EITHER a
+  /// `subjects[]` OR a `banner.banners[]` whose entries carry a nested
+  /// `subject`. Empty rails are dropped rather than rendered as a heading with
+  /// nothing under it.
+  Future<List<KinoRail>> home({String tabId = '0', int page = 1}) async {
+    final data = await _send(
+      'GET',
+      '/wefeed-mobile-bff/tab-operating?page=$page&tabId=$tabId&version=',
+    );
+
+    final items = data['items'];
+    if (items is! List) return const [];
+
+    final rails = <KinoRail>[];
+    for (final raw in items) {
+      if (raw is! Map) continue;
+      final item = raw.cast<String, dynamic>();
+      final title = item['title']?.toString() ?? '';
+      final found = <KinoItem>[];
+
+      final subjects = item['subjects'];
+      if (subjects is List) {
+        for (final subject in subjects) {
+          if (subject is Map) found.add(_itemFromJson(subject));
+        }
+      }
+
+      // A banner rail's titles are one level deeper, under `subject`.
+      final banner = item['banner'];
+      if (banner is Map && banner['banners'] is List) {
+        for (final entry in (banner['banners'] as List)) {
+          if (entry is! Map) continue;
+          final subject = entry['subject'];
+          if (subject is Map) found.add(_itemFromJson(subject));
+        }
+      }
+
+      if (found.isEmpty || title.isEmpty) continue;
+      rails.add(KinoRail(title: title, items: found));
+    }
+
+    return rails;
+  }
+
+  /// Search.
+  ///
+  /// Measured shape: `data.results[]` is a list of RAILS, each with a nested
+  /// `subjects[]` -- not a flat list. Flattened here because a search screen
+  /// wants one grid, and rail boundaries are noise at that point.
+  Future<List<KinoItem>> search(String query, {int page = 1}) async {
+    final body = jsonEncode({
+      'keyword': query,
+      'page': page,
+      'perPage': 15,
+      'subjectType': 0,
+    });
+
+    final data = await _send(
+      'POST',
+      '/wefeed-mobile-bff/subject-api/search/v2',
+      body: body,
+    );
+
+    final results = data['results'];
+    if (results is! List) return const [];
+
+    final items = <KinoItem>[];
+    final seen = <String>{};
+
+    for (final rail in results) {
+      if (rail is! Map) continue;
+      final subjects = rail['subjects'];
+      if (subjects is! List) continue;
+      for (final subject in subjects) {
+        if (subject is! Map) continue;
+        final item = _itemFromJson(subject);
+        // The same title appears in more than one rail when the query names a
+        // franchise, so a plain flatten would show duplicates.
+        if (item.id.isEmpty || !seen.add(item.id)) continue;
+        items.add(item);
+      }
+    }
+
+    return items;
+  }
+
+  /// Details for one title, with its seasons when it is a series.
+  Future<Map<String, dynamic>> details(String id) async {
+    final data = await _send(
+      'GET',
+      '/wefeed-mobile-bff/subject-api/get?subjectId=$id',
+    );
+
+    // `subjectType == 2` is a series. Checked on the value rather than on the
+    // presence of a seasons key, because a film can carry an empty one.
+    final subjectType = data['subjectType'];
+    if (subjectType == 2) {
+      try {
+        data['__seasons'] = await _send(
+          'GET',
+          '/wefeed-mobile-bff/subject-api/season-info?subjectId=$id',
+        );
+      } catch (_) {
+        // A series whose season list failed still renders its own details.
+        // Losing the episode list is a smaller failure than losing the page.
+      }
+    }
+
+    return data;
+  }
+
+  /// Playable streams for a title, or one episode of it.
+  ///
+  /// Two independent paths are asked and merged: `play-info/v2` and `resource`.
+  /// That is not belt-and-braces -- the upstream client does the same, and it is
+  /// why playback survives one of them changing. Either failing is fine; both
+  /// failing throws.
+  Future<List<KinoStream>> streams(
+    String subjectId, {
+    int season = 0,
+    int episode = 0,
+  }) async {
+    final streams = <KinoStream>[];
+    final seen = <String>{};
+
+    void absorb(Map<String, dynamic> data) {
+      // Measured: resources live under `list`, and the playable address is
+      // either a top-level `url` or a nested `playUrl.playUrl`.
+      final list = data['list'] ?? data['items'];
+      if (list is! List) return;
+
+      for (final raw in list) {
+        if (raw is! Map) continue;
+        final entry = raw.cast<String, dynamic>();
+
+        String? url = entry['url']?.toString();
+        final playUrl = entry['playUrl'];
+        if (url == null && playUrl is Map) {
+          url = playUrl['playUrl']?.toString();
+        }
+        if (url == null || url.isEmpty) continue;
+
+        // Deduped on the path without its query: the same stream is offered more
+        // than once with different signing parameters.
+        final base = url.split('?').first;
+        if (!seen.add(base)) continue;
+
+        final rawResolution = entry['resolution'];
+        final resolution = rawResolution is int
+            ? rawResolution
+            : int.tryParse(rawResolution?.toString() ?? '');
+
+        streams.add(KinoStream(
+          url: url,
+          label: resolution != null ? '${resolution}p' : 'auto',
+          resolution: resolution,
+          headers: const {'Referer': streamReferer},
+        ));
+      }
+    }
+
+    final suffix = (season == 0 && episode == 0) ? '' : '&se=$season&ep=$episode';
+
+    Object? lastError;
+    var anySucceeded = false;
+
+    try {
+      absorb(await _send(
+        'GET',
+        '/wefeed-mobile-bff/subject-api/play-info/v2?subjectId=$subjectId$suffix',
+      ));
+      anySucceeded = true;
+    } catch (err) {
+      lastError = err;
+    }
+
+    try {
+      absorb(await _send(
+        'GET',
+        '/wefeed-mobile-bff/subject-api/resource'
+        '?subjectId=$subjectId$suffix&page=1&perPage=20',
+      ));
+      anySucceeded = true;
+    } catch (err) {
+      lastError = err;
+    }
+
+    if (!anySucceeded) {
+      throw MovieBoxException('Neither stream endpoint answered: $lastError');
+    }
+
+    // Highest resolution first; the player takes the first it can open.
+    streams.sort((a, b) => (b.resolution ?? 0).compareTo(a.resolution ?? 0));
+    return streams;
+  }
+
+  /// Extracts seasons from a details response.
+  ///
+  /// A helper rather than more parsing inside [details], so a screen can call
+  /// this without knowing the envelope `season-info` returns. That envelope was
+  /// NOT measured -- only search and home were -- so this reads several
+  /// plausible keys and returns nothing rather than throwing when none match.
+  /// A series page with no episode list is a smaller failure than a crash.
+  static List<KinoSeason> seasonsOf(Map<String, dynamic> details) {
+    final raw = details['__seasons'];
+    if (raw is! Map) return const [];
+
+    final list = raw['seasons'] ?? raw['list'] ?? raw['items'];
+    if (list is! List) return const [];
+
+    final seasons = <KinoSeason>[];
+    for (final entry in list) {
+      if (entry is! Map) continue;
+      final map = entry.cast<String, dynamic>();
+      final number = map['season'] ?? map['se'] ?? map['seasonNumber'];
+      final season = number is int ? number : int.tryParse('$number') ?? 0;
+      if (season <= 0) continue;
+
+      final episodes = map['episodes'] ?? map['episodeList'];
+      var count = 0;
+      if (episodes is List) {
+        count = episodes.length;
+      } else {
+        final rawCount = map['episodeCount'] ?? map['totalEpisode'];
+        count = rawCount is int ? rawCount : int.tryParse('$rawCount') ?? 0;
+      }
+
+      seasons.add(KinoSeason(season: season, episodeCount: count));
+    }
+
+    seasons.sort((a, b) => a.season.compareTo(b.season));
+    return seasons;
+  }
+
+  /// One authenticated call, with failover across the host pool.
+  Future<Map<String, dynamic>> _send(
+    String method,
+    String path, {
+    String? body,
+  }) async {
+    final token = await ensureToken();
+    Object? lastError;
+
+    for (int attempt = 0; attempt < _hosts.length; attempt++) {
+      final index = (_activeHost + attempt) % _hosts.length;
+      final url = Uri.parse(_hosts[index] + path);
+
+      try {
+        final headers = MovieBoxSigner.headers(
+          method: method,
+          url: url,
+          clientInfo: _clientInfo,
+          userAgent: _userAgent,
+          body: body,
+        );
+        headers['authorization'] = 'Bearer $token';
+
+        final response = method == 'POST'
+            ? await _http.post(url, headers: headers, body: body)
+            : await _http.get(url, headers: headers);
+
+        if (_retryStatuses.contains(response.statusCode)) {
+          lastError = MovieBoxException(
+            'HTTP ${response.statusCode} from ${_hosts[index]}: ${response.body}',
+          );
+          // A rejected token is dropped so the NEXT call re-authenticates. Doing
+          // it inline would make failover and re-auth fight over the same state.
+          if (response.statusCode == 401 || response.statusCode == 407) {
+            _token = null;
+            _expiry = null;
+          }
+          continue;
+        }
+
+        final decoded = jsonDecode(response.body);
+        if (decoded is! Map) {
+          lastError = const MovieBoxException('Response was not an object');
+          continue;
+        }
+
+        // The host that answered is preferred from here, so a dead host costs
+        // one request rather than one per call.
+        _activeHost = index;
+
+        if (response.statusCode != 200) {
+          throw MovieBoxException(
+            'HTTP ${response.statusCode}: ${response.body}',
+          );
+        }
+
+        final data = decoded['data'];
+        return data is Map
+            ? Map<String, dynamic>.from(data)
+            : decoded.cast<String, dynamic>();
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    throw MovieBoxException('Every host failed. Last: $lastError');
+  }
+
+  /// Parses one subject.
+  ///
+  /// Field names taken from a measured search response. Note that `subjectId`
+  /// arrives QUOTED and `cover` is an object -- the two facts the earlier draft
+  /// got wrong, and the two whose failure looks like "no results" rather than
+  /// like an error.
+  static KinoItem _itemFromJson(Map raw) {
+    final map = raw.cast<String, dynamic>();
+
+    String? poster;
+    final cover = map['cover'];
+    if (cover is Map) {
+      poster = cover['url']?.toString();
+    } else if (cover is String) {
+      // Accepted as a fallback so a change on their side degrades rather than
+      // blanking every card.
+      poster = cover;
+    }
+
+    final subjectType = map['subjectType'];
+    final rating = map['imdbRatingValue'] ?? map['rating'];
+
+    return KinoItem(
+      id: (map['subjectId'] ?? map['id'] ?? '').toString(),
+      title: (map['title'] ?? map['name'] ?? '').toString(),
+      poster: poster,
+      year: map['releaseDate']?.toString().split('-').first,
+      // A STRING in the response ("8.4"), which is why this parses rather than
+      // casts -- a cast would throw at runtime on every card.
+      rating: rating is num
+          ? rating.toDouble()
+          : double.tryParse(rating?.toString() ?? ''),
+      subjectType: subjectType is int ? subjectType : 1,
+      hasResource: map['hasResource'] == true,
+    );
   }
 }
 
