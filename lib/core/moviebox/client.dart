@@ -53,6 +53,13 @@ class KinoStream {
   final String label;
   final int? resolution;
 
+  /// The API will serve only a preview of this one to a visitor token
+  /// (`requireMemberType > 0`, `previewSeconds` in the response).
+  ///
+  /// Carried rather than filtered: it IS playable, just not entirely, and
+  /// dropping it would hide content a signed-in build could use.
+  final bool preview;
+
   /// Some hosts refuse a request without a Referer. Carried per-stream rather
   /// than assumed globally.
   final Map<String, String> headers;
@@ -61,6 +68,7 @@ class KinoStream {
     required this.url,
     required this.label,
     this.resolution,
+    this.preview = false,
     this.headers = const {},
   });
 }
@@ -324,36 +332,61 @@ class MovieBoxClient {
     final seen = <String>{};
 
     void absorb(Map<String, dynamic> data) {
-      // Measured: resources live under `list`, and the playable address is
-      // either a top-level `url` or a nested `playUrl.playUrl`.
-      final list = data['list'] ?? data['items'];
+      // **Measured 2026-10-14, and the two endpoints do NOT agree.** This is the
+      // bug that made every title report "No playable sources were returned"
+      // while search and home looked perfectly healthy -- both are 200s with
+      // real content, and neither parser could see it:
+      //
+      //   play-info/v2 -> { streams[] }  address under `url`,
+      //                                  resolution under `resolutions` ("480")
+      //   resource     -> { list[] }     address under `resourceLink`,
+      //                                  resolution under `resolution` (480)
+      //
+      // The old code read only `list`/`items`, so play-info contributed nothing;
+      // and it read only `url`/`playUrl.playUrl`, so resource contributed nothing
+      // either. Two independent misses that present as one empty list.
+      //
+      // `sourceUrl` is present on resource entries and is deliberately NOT read:
+      // it is a web page (vegamovies.pet/...), not a stream. Feeding it to the
+      // player fails as an unplayable source, which is harder to diagnose than
+      // an absent one.
+      final list = data['streams'] ?? data['list'] ?? data['items'];
       if (list is! List) return;
 
       for (final raw in list) {
         if (raw is! Map) continue;
         final entry = raw.cast<String, dynamic>();
 
-        String? url = entry['url']?.toString();
-        final playUrl = entry['playUrl'];
-        if (url == null && playUrl is Map) {
-          url = playUrl['playUrl']?.toString();
-        }
-        if (url == null || url.isEmpty) continue;
+        final url = _urlOf(entry);
+        if (url == null) continue;
 
         // Deduped on the path without its query: the same stream is offered more
         // than once with different signing parameters.
         final base = url.split('?').first;
         if (!seen.add(base)) continue;
 
-        final rawResolution = entry['resolution'];
+        // `resolutions` is a STRING where `resolution` is an int, so this parses
+        // rather than casts -- a cast would drop every play-info stream.
+        final rawResolution = entry['resolution'] ?? entry['resolutions'];
         final resolution = rawResolution is int
             ? rawResolution
             : int.tryParse(rawResolution?.toString() ?? '');
 
+        // Not a filter, a preference. `requireMemberType > 0` marks a resource
+        // the API will only preview for a visitor token, so a gated 1080p entry
+        // sorting above a free 480p one would play for six minutes and stop --
+        // a failure with no error in it, which is the worst kind here.
+        final requiresMember = entry['requireMemberType'];
+        final gated = requiresMember is int && requiresMember > 0;
+
         streams.add(KinoStream(
           url: url,
-          label: resolution != null ? '${resolution}p' : 'auto',
+          label: [
+            resolution != null ? '${resolution}p' : 'auto',
+            if (gated) 'preview',
+          ].join(' · '),
           resolution: resolution,
+          preview: gated,
           headers: const {'Referer': streamReferer},
         ));
       }
@@ -389,9 +422,48 @@ class MovieBoxClient {
       throw MovieBoxException('Neither stream endpoint answered: $lastError');
     }
 
-    // Highest resolution first; the player takes the first it can open.
-    streams.sort((a, b) => (b.resolution ?? 0).compareTo(a.resolution ?? 0));
+    // Free before gated, then highest resolution first. The player takes the
+    // first it can open, so a preview-only entry must not outrank a full one --
+    // it would open, and then stop partway through.
+    streams.sort((a, b) {
+      if (a.preview != b.preview) return a.preview ? 1 : -1;
+      return (b.resolution ?? 0).compareTo(a.resolution ?? 0);
+    });
     return streams;
+  }
+
+  /// The playable address of one stream entry.
+  ///
+  /// **Three names, because the two endpoints disagree** and picking one is
+  /// wrong for the other. Measured:
+  ///
+  ///   * `url`          -- play-info/v2's name for it
+  ///   * `resourceLink` -- resource's name for it
+  ///   * `playUrl.playUrl` -- nested; not in either measured response, kept
+  ///                        because it costs one branch and removes a future
+  ///                        surprise
+  ///
+  /// Each candidate is checked for emptiness rather than for null: a field that
+  /// is present but blank would otherwise win over a populated fallback and
+  /// produce a stream that opens onto nothing.
+  ///
+  /// `sourceUrl` is NOT a candidate. It sits beside `resourceLink` on resource
+  /// entries and is a web page (vegamovies.pet/...), not a media file -- handing
+  /// it to the player fails as an unplayable source, which reads as a CDN
+  /// problem rather than as a parser one.
+  static String? _urlOf(Map<String, dynamic> entry) {
+    for (final key in const ['url', 'resourceLink']) {
+      final value = entry[key];
+      if (value is String && value.isNotEmpty) return value;
+    }
+
+    final playUrl = entry['playUrl'];
+    if (playUrl is Map) {
+      final nested = playUrl['playUrl'];
+      if (nested is String && nested.isNotEmpty) return nested;
+    }
+
+    return null;
   }
 
   /// Extracts seasons from a details response.
