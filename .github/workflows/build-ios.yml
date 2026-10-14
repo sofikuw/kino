@@ -60,6 +60,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Flutter FIRST. The scaffold step below calls `flutter create`, so a
+      # setup step placed after it fails with `flutter: command not found` --
+      # which is exactly what run #1 did, and the log made it obvious only
+      # because the steps were listed in their executed order.
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
       # Scaffolds into a throwaway directory and reports what it made, so a
       # failure here is distinguishable from a failure in the Dart.
       - name: Scaffold the platform project
@@ -74,7 +85,7 @@ jobs:
             scaffold
           echo "scaffold contents:"
           ls scaffold
-          echo "artifact_name=anImestream-kino-ios-unsigned" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=kino-ios-unsigned" >> "$GITHUB_OUTPUT"
 
       # The authored Dart replaces the scaffold's. `--no-pub` above means the
       # scaffold's own lib/main.dart is inert until this point.
@@ -100,16 +111,9 @@ jobs:
           echo "lib tree:"
           find scaffold/lib -type f | sort
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
-
-      # `flutter analyze` before `pub get` is deliberate: analyze needs the
-      # dependency graph, so it runs after. This step is the app's only
-      # compile check before the very slow xcodebuild.
+      # Resolve, then analyze. Analyze needs the dependency graph, so it cannot
+      # come first -- and it is the app's only compile check before the very
+      # slow xcodebuild.
       - name: Resolve dependencies
         working-directory: scaffold
         run: flutter pub get
