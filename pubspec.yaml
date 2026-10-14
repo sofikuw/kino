@@ -1,0 +1,34 @@
+name: kino
+description: "A Material 3 movie and TV streaming app."
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  http: ^1.2.2
+  crypto: ^3.0.6
+  provider: ^6.1.2
+
+  # Playback. media_kit rather than video_player because MovieBox streams require
+  # a `Referer: https://sportslive.wine` header, and Flutter's own video_player
+  # cannot send headers on iOS at all. media_kit can, and it is the lighter of
+  # the two header-capable options.
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.5
+
+  cached_network_image: ^3.4.1
+  shared_preferences: ^2.3.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
