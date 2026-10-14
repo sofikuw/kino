@@ -102,6 +102,15 @@ jobs:
           rm -rf scaffold/lib
           cp -r lib scaffold/lib
 
+          # `flutter create` also writes test/widget_test.dart, which instantiates
+          # a class called `MyApp` -- the scaffold's demo app. This app's root is
+          # `KinoApp`, so that test fails `flutter analyze` with
+          # "The name 'MyApp' isn't a class" even though every file in lib/ is
+          # correct. Removing it rather than adding a MyApp alias to satisfy a
+          # test nobody wrote: the app currently has no tests, and a stub test
+          # asserting the demo counter increments would be worse than none.
+          rm -rf scaffold/test
+
           # pubspec LAST, and deliberately so: flutter create writes its own, and
           # copying the authored one before scaffolding would have it silently
           # replaced -- leaving an app that resolves none of its dependencies.
@@ -110,6 +119,8 @@ jobs:
           head -20 scaffold/pubspec.yaml
           echo "lib tree:"
           find scaffold/lib -type f | sort
+          echo "test tree (should be empty):"
+          find scaffold/test -type f 2>/dev/null || echo "  (no test directory)"
 
       # Resolve, then analyze. Analyze needs the dependency graph, so it cannot
       # come first -- and it is the app's only compile check before the very
