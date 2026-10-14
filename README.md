@@ -2,7 +2,7 @@
 
 **A Material 3 movie and TV app for iOS.**
 
-Named for *cinephage* — a devourer of film. It streams from **MovieBox**, and it
+Named for *kino* — It streams from **MovieBox**, and it
 is built in the open about what that means rather than around it.
 
 ## Status: step one
